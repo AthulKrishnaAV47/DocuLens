@@ -54,5 +54,11 @@ class DocuLensEngine:
             _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             self.state_history["Standard_otsu"] = thresh
             return thresh
-    
+    def apply_adaptive_threshold(self, gray):
+                """Method: Localized Adaptive Thresholding for shadows/glare"""
+                filtered = cv2.bilateralFilter(gray, 9, 75, 75) 
+                thresh = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                               cv2.THRESH_BINARY, 11, 2)
+                self.state_history["adaptive_thresh"] = thresh
+                return thresh
         
