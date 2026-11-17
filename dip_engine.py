@@ -48,4 +48,11 @@ class DocuLensEngine:
         self.state_history["diagnostics"] = diagnostics
         return diagnostics
 
+    def apply_standard_otsu(self, gray):
+            """Method: Standard Global Thresholding"""
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            self.state_history["Standard_otsu"] = thresh
+            return thresh
     
+        
