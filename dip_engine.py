@@ -1,14 +1,15 @@
 import cv2
-import scipy
 import numpy as np
-import skimage
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
 import pytesseract
+from pytesseract import Output
 
 class DocuLensEngine:
     def __init__(self):
         self.state_history = {}
 
-    def access_quality(self, crop_image):
+    def assess_quality(self, crop_image):
         """Analyze the raw image and output multi-dimensional quality vector"""
 
         if len(crop_image) == 3:
@@ -61,4 +62,83 @@ class DocuLensEngine:
                                                cv2.THRESH_BINARY, 11, 2)
                 self.state_history["adaptive_thresh"] = thresh
                 return thresh
+
+    def apply_unsharp_mask(self, gray):
+        """Method C: Sharpening kernel prior to thresholding for blurred images[cite: 6]."""
+        gaussian = cv2.GaussianBlur(gray, (9, 9), 10.0)
+        sharpened = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+        _, thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self.state_history["unsharp_mask"] = thresh
+        return thresh
+
+
+    def calculate_metrics(self, original_gray, processed_image):
+        """Calculates SSIM, PSNR, and OCR confidence scores[cite: 3, 6]."""
+        # Determine the smallest dimension of the image
+        min_dim = min(original_gray.shape)
         
+        # Dynamically handle the SSIM win_size constraint
+        if min_dim < 7:
+            if min_dim < 3:
+                ssim_score = 0.0  # Image is too small for any structural comparison
+            else:
+                # win_size must be an odd number less than or equal to min_dim
+                win_size = min_dim if min_dim % 2 != 0 else min_dim - 1
+                ssim_score = ssim(original_gray, processed_image, win_size=win_size)
+        else:
+            ssim_score = ssim(original_gray, processed_image) # Uses default win_size=7
+
+        psnr_score = psnr(original_gray, processed_image)
+        
+        # Pytesseract OCR evaluation[cite: 3]
+        ocr_data = pytesseract.image_to_data(processed_image, output_type=Output.DICT)
+        confidences = [int(conf) for conf in ocr_data['conf'] if int(conf) != -1]
+        avg_ocr_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
+        return {
+            "SSIM": round(ssim_score, 4),
+            "PSNR": round(psnr_score, 2),
+            "OCR_Confidence": round(avg_ocr_conf, 2)
+        }
+
+    def select_optimal_pipeline(self, diagnostics):
+        """Lightweight decision module to automatically select the optimal pipeline[cite: 6]."""
+        flags = diagnostics["flags"]
+        
+        if flags["glare"] == "Red" or flags["contrast"] == "Red":
+            return "Adaptive"
+        elif flags["sharpness"] == "Red":
+            return "Sharpening"
+        else:
+            return "Standard"
+
+
+    def process_document(self, cropped_bgr):
+        """The main API endpoint that Sridhar C's frontend will call[cite: 9]."""
+        self.state_history = {} # Reset state
+        self.state_history["original_crop"] = cropped_bgr
+        
+        gray = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2GRAY)
+        self.state_history["grayscale"] = gray
+
+        diagnostics = self.assess_quality(gray)
+
+        otsu_res = self.apply_standard_otsu(gray)
+        adaptive_res = self.apply_adaptive_threshold(gray)
+        sharpen_res = self.apply_unsharp_mask(gray)
+
+        metrics = {
+            "Standard": self.calculate_metrics(gray, otsu_res),
+            "Adaptive": self.calculate_metrics(gray, adaptive_res),
+            "Sharpening": self.calculate_metrics(gray, sharpen_res)
+        }
+
+        best_method = self.select_optimal_pipeline(diagnostics)
+
+        payload = {
+            "diagnostics": diagnostics,
+            "recommended_method": best_method,
+            "comparative_metrics": metrics,
+            "intermediate_images": self.state_history
+        }
+        return payload
