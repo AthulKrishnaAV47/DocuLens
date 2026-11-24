@@ -1,160 +1,134 @@
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
-from skimage.metrics import peak_signal_noise_ratio as psnr
-import pytesseract
-from pytesseract import Output
+from detection import detect_corners, warp_from_corners
+
 
 class DocuLensEngine:
-    def __init__(self):
-        self.state_history = {}
+    """Classical CPU-based document enhancement and quality diagnostic engine."""
 
-    def assess_quality(self, crop_image):
-        """Analyze the raw image and output multi-dimensional quality vector"""
+    def analyze_quality(self, image: np.ndarray) -> dict:
+        """Evaluates sharpness, contrast, and specular glare for UI warnings."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
 
-        if len(crop_image) == 3:
-            gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = crop_image
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        sharpness = "Green" if lap_var >= 150 else ("Yellow" if lap_var >= 60 else "Red")
 
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        sharpness_flag = "Red" if laplacian_var < 100 else ("Yellow" if laplacian_var < 300 else "Green")
+        std_dev = float(np.std(gray))
+        contrast = "Green" if std_dev >= 55 else ("Yellow" if std_dev >= 35 else "Red")
 
-        contrast_std = np.std(gray)
-        contrast_flag = "Red" if contrast_std < 30 else ("Yellow" if contrast_std < 50 else "Green")
+        glare_ratio = float(np.sum(gray >= 245)) / gray.size
+        glare = "Green" if glare_ratio <= 0.05 else ("Yellow" if glare_ratio <= 0.15 else "Red")
 
-        glare_mask = cv2.inRange(gray, 240, 255)
-        glare_ratio = np.sum(glare_mask > 0) / gray.size
-        glare_flag = "Red" if glare_ratio > 0.05 else ("Yellow" if glare_ratio > 0.02 else "Green")
+        advice_parts = []
+        if sharpness == "Red":
+            advice_parts.append("Image is blurry; hold steady or tap to focus.")
+        if contrast == "Red":
+            advice_parts.append("Low contrast; improve ambient lighting.")
+        if glare == "Red":
+            advice_parts.append("Heavy glare detected; tilt camera slightly away from light.")
+        advice = " ".join(advice_parts) if advice_parts else "Good capture quality."
 
-        advice = []
-        if sharpness_flag == "Red": advice.append("Image is heavily blurred. Hold the camera steady.")
-        if contrast_flag == "Red": advice.append("Poor contrast. Move to a well-lit environment.")
-        if glare_flag == "Red": advice.append("Severe glare detected. Move away from direct overhead light.")
-        if not advice: advice.append("Lighting and focus look good!")
-
-        diagnostics = {
-            "metrics": {
-                "sharpness": round(laplacian_var, 2),
-                "contrast": round(contrast_std, 2),
-                "glare_ratio": round(glare_ratio, 4)
+        return {
+            "flags": {"sharpness": sharpness, "contrast": contrast, "glare": glare},
+            "raw": {
+                "laplacian_var": round(lap_var, 2),
+                "std_dev": round(std_dev, 2),
+                "glare_ratio": round(glare_ratio, 4),
             },
-            "flags": {
-                "sharpness": sharpness_flag,
-                "contrast": contrast_flag,
-                "glare": glare_flag
-            },
-            "advice": " ".join(advice)
+            "advice": advice,
         }
-        self.state_history["diagnostics"] = diagnostics
-        return diagnostics
 
-    def _remove_shadows(self, gray):
+    def _remove_shadows(self, gray: np.ndarray) -> np.ndarray:
         """Estimates uneven background lighting and normalizes it to pure white."""
         dilated = cv2.dilate(gray, np.ones((7, 7), np.uint8))
         bg = cv2.medianBlur(dilated, 21)
-        # Divide original by background to flatten shadows
         norm = 255 - cv2.absdiff(gray, bg)
         return cv2.normalize(norm, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
 
-    def apply_standard_otsu(self, gray):
-        """Method A: Shadow-normalized + Otsu (clean black & white scan)."""
+    def apply_color_scan(self, bgr_image: np.ndarray) -> np.ndarray:
+        """
+        Preset 1 (Default): Photo-safe LAB enhancement.
+        Brightens lighting and sharpens text while preserving faces, stamps, and colored ink.
+        """
+        if len(bgr_image.shape) == 2:
+            return self.apply_bw_crisp(bgr_image)
+
+        lab = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l)
+
+        gaussian = cv2.GaussianBlur(l_eq, (0, 0), 1.5)
+        l_sharp = cv2.addWeighted(l_eq, 1.35, gaussian, -0.35, 0)
+
+        p2, p98 = np.percentile(l_sharp, (2, 98))
+        if p98 > p2:
+            l_final = np.clip(
+                (l_sharp.astype(np.float32) - p2) * (255.0 / (p98 - p2)), 0, 255
+            ).astype(np.uint8)
+        else:
+            l_final = l_sharp
+
+        return cv2.cvtColor(cv2.merge([l_final, a, b]), cv2.COLOR_LAB2BGR)
+
+    def apply_bw_crisp(self, image: np.ndarray) -> np.ndarray:
+        """
+        Preset 2: Shadow-normalized black & white scan.
+        Best for receipts, printed forms, and handwritten notes.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         norm = self._remove_shadows(gray)
         blurred = cv2.GaussianBlur(norm, (3, 3), 0)
         _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        self.state_history["standard_otsu"] = thresh
-        return thresh
+        return cv2.medianBlur(thresh, 3)
 
-    def apply_adaptive_threshold(self, gray):
-        """Method B: Tuned Adaptive Thresholding (larger window kills speckles)."""
-        norm = self._remove_shadows(gray)
-        filtered = cv2.bilateralFilter(norm, 9, 75, 75)
-        # Larger blockSize (31) and higher C (15) remove background grain
-        thresh = cv2.adaptiveThreshold(
-            filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 31, 15
-        )
-        self.state_history["adaptive_thresh"] = thresh
-        return thresh
+    def enhance(self, image: np.ndarray, preset: str = "color_scan") -> np.ndarray:
+        """
+        Applies the selected enhancement preset.
+        preset: 'color_scan' | 'bw_crisp' | 'original'
+        """
+        if preset == "bw_crisp":
+            return self.apply_bw_crisp(image)
+        if preset == "original":
+            return image.copy()
+        return self.apply_color_scan(image)
 
-    def apply_unsharp_mask(self, gray):
-        """Method C: CLAHE local contrast + Unsharp Mask (best for blurry/faded ink)."""
-        norm = self._remove_shadows(gray)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(norm)
-        gaussian = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
-        sharpened = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
-        _, thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        self.state_history["unsharp_mask"] = thresh
-        return thresh
-    
-    def calculate_metrics(self, original_gray, processed_image):
-        """Calculates SSIM, PSNR, and OCR confidence scores[cite: 3, 6]."""
-        # Determine the smallest dimension of the image
-        min_dim = min(original_gray.shape)
-        
-        # Dynamically handle the SSIM win_size constraint
-        if min_dim < 7:
-            if min_dim < 3:
-                ssim_score = 0.0  # Image is too small for any structural comparison
-            else:
-                # win_size must be an odd number less than or equal to min_dim
-                win_size = min_dim if min_dim % 2 != 0 else min_dim - 1
-                ssim_score = ssim(original_gray, processed_image, win_size=win_size)
+
+_engine = DocuLensEngine()
+
+
+def process_scan(
+    image: np.ndarray,
+    corners: list | None = None,
+    preset: str = "color_scan",
+    crop: bool = True,
+) -> dict:
+    """
+    Production entry point for backend/frontend integration.
+    - crop=True + corners provided: warps using user-adjusted corners.
+    - crop=True + corners=None: auto-detects (falls back to full image if missed).
+    - crop=False: enhances the full uncropped image.
+    """
+    target = image
+    was_cropped = False
+
+    if crop:
+        if corners is not None:
+            target = warp_from_corners(image, corners)
+            was_cropped = True
         else:
-            ssim_score = ssim(original_gray, processed_image) # Uses default win_size=7
+            auto_corners, detected = detect_corners(image)
+            if detected:
+                target = warp_from_corners(image, auto_corners)
+                was_cropped = True
 
-        psnr_score = psnr(original_gray, processed_image)
-        
-        # Pytesseract OCR evaluation[cite: 3]
-        ocr_data = pytesseract.image_to_data(processed_image, output_type=Output.DICT)
-        confidences = [int(conf) for conf in ocr_data['conf'] if int(conf) != -1]
-        avg_ocr_conf = sum(confidences) / len(confidences) if confidences else 0.0
+    enhanced = _engine.enhance(target, preset=preset)
+    diagnostics = _engine.analyze_quality(target)
 
-        return {
-            "SSIM": round(ssim_score, 4),
-            "PSNR": round(psnr_score, 2),
-            "OCR_Confidence": round(avg_ocr_conf, 2)
-        }
-
-    def select_optimal_pipeline(self, diagnostics):
-        """Lightweight decision module to automatically select the optimal pipeline[cite: 6]."""
-        flags = diagnostics["flags"]
-        
-        if flags["glare"] == "Red" or flags["contrast"] == "Red":
-            return "Adaptive"
-        elif flags["sharpness"] == "Red":
-            return "Sharpening"
-        else:
-            return "Standard"
-
-
-    def process_document(self, cropped_bgr):
-        """The main API endpoint that Sridhar C's frontend will call[cite: 9]."""
-        self.state_history = {} # Reset state
-        self.state_history["original_crop"] = cropped_bgr
-        
-        gray = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2GRAY)
-        self.state_history["grayscale"] = gray
-
-        diagnostics = self.assess_quality(gray)
-
-        otsu_res = self.apply_standard_otsu(gray)
-        adaptive_res = self.apply_adaptive_threshold(gray)
-        sharpen_res = self.apply_unsharp_mask(gray)
-
-        metrics = {
-            "Standard": self.calculate_metrics(gray, otsu_res),
-            "Adaptive": self.calculate_metrics(gray, adaptive_res),
-            "Sharpening": self.calculate_metrics(gray, sharpen_res)
-        }
-
-        best_method = self.select_optimal_pipeline(diagnostics)
-
-        payload = {
-            "diagnostics": diagnostics,
-            "recommended_method": best_method,
-            "comparative_metrics": metrics,
-            "intermediate_images": self.state_history
-        }
-        return payload
+    return {
+        "enhanced_image": enhanced,
+        "cropped": was_cropped,
+        "preset": preset,
+        "diagnostics": diagnostics,
+    }
