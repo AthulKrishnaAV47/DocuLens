@@ -49,29 +49,45 @@ class DocuLensEngine:
         self.state_history["diagnostics"] = diagnostics
         return diagnostics
 
+    def _remove_shadows(self, gray):
+        """Estimates uneven background lighting and normalizes it to pure white."""
+        dilated = cv2.dilate(gray, np.ones((7, 7), np.uint8))
+        bg = cv2.medianBlur(dilated, 21)
+        # Divide original by background to flatten shadows
+        norm = 255 - cv2.absdiff(gray, bg)
+        return cv2.normalize(norm, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+
     def apply_standard_otsu(self, gray):
-            """Method: Standard Global Thresholding"""
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            self.state_history["Standard_otsu"] = thresh
-            return thresh
+        """Method A: Shadow-normalized + Otsu (clean black & white scan)."""
+        norm = self._remove_shadows(gray)
+        blurred = cv2.GaussianBlur(norm, (3, 3), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self.state_history["standard_otsu"] = thresh
+        return thresh
+
     def apply_adaptive_threshold(self, gray):
-                """Method: Localized Adaptive Thresholding for shadows/glare"""
-                filtered = cv2.bilateralFilter(gray, 9, 75, 75) 
-                thresh = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                               cv2.THRESH_BINARY, 11, 2)
-                self.state_history["adaptive_thresh"] = thresh
-                return thresh
+        """Method B: Tuned Adaptive Thresholding (larger window kills speckles)."""
+        norm = self._remove_shadows(gray)
+        filtered = cv2.bilateralFilter(norm, 9, 75, 75)
+        # Larger blockSize (31) and higher C (15) remove background grain
+        thresh = cv2.adaptiveThreshold(
+            filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 15
+        )
+        self.state_history["adaptive_thresh"] = thresh
+        return thresh
 
     def apply_unsharp_mask(self, gray):
-        """Method C: Sharpening kernel prior to thresholding for blurred images[cite: 6]."""
-        gaussian = cv2.GaussianBlur(gray, (9, 9), 10.0)
-        sharpened = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+        """Method C: CLAHE local contrast + Unsharp Mask (best for blurry/faded ink)."""
+        norm = self._remove_shadows(gray)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(norm)
+        gaussian = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
+        sharpened = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
         _, thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         self.state_history["unsharp_mask"] = thresh
         return thresh
-
-
+    
     def calculate_metrics(self, original_gray, processed_image):
         """Calculates SSIM, PSNR, and OCR confidence scores[cite: 3, 6]."""
         # Determine the smallest dimension of the image
